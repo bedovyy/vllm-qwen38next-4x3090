@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 from typing import ClassVar, cast
+import json
+import os
 
 import torch
 from torch import nn
@@ -56,6 +58,136 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+def _apply_qsa_fp8_scales(layer: nn.Module) -> None:
+    """Load static per-tensor K/V scales for the FP8 QSA main cache.
+
+    Sources, in priority order:
+    1. QSA_FP8_SCALES_FILE: JSON ``{"k_scale": f, "v_scale": f}`` applied to
+       every layer, or ``{"per_layer": {"<layer_name>": {"k_scale": f,
+       "v_scale": f}, ...}, "default": {"k_scale": f, "v_scale": f}}``.
+    2. QSA_FP8_K_SCALE + QSA_FP8_V_SCALE environment floats (both required).
+    3. Fallback 1.0 with an explicit non-quality warning.
+
+    A requested but unreadable/incomplete calibrated source is a hard error;
+    silent fallback to 1.0 would corrupt quality measurements (VALIDATION.md).
+    """
+    scales_file = os.environ.get("QSA_FP8_SCALES_FILE")
+    k_scale = v_scale = None
+    if scales_file:
+        with open(scales_file) as f:  # hard error if missing: intentional
+            data = json.load(f)
+        entry = None
+        per_layer = data.get("per_layer")
+        if per_layer and layer.layer_name in per_layer:
+            entry = per_layer[layer.layer_name]
+        elif "default" in data:
+            entry = data["default"]
+        elif "k_scale" in data:
+            entry = data
+        if entry is None or "k_scale" not in entry or "v_scale" not in entry:
+            raise ValueError(
+                f"QSA_FP8_SCALES_FILE={scales_file} has no k_scale/v_scale "
+                f"entry for layer {layer.layer_name}"
+            )
+        k_scale, v_scale = float(entry["k_scale"]), float(entry["v_scale"])
+        source = f"file {scales_file}"
+    else:
+        env_k = os.environ.get("QSA_FP8_K_SCALE")
+        env_v = os.environ.get("QSA_FP8_V_SCALE")
+        if (env_k is None) != (env_v is None):
+            raise ValueError(
+                "QSA_FP8_K_SCALE and QSA_FP8_V_SCALE must be set together"
+            )
+        if env_k is not None:
+            k_scale, v_scale = float(env_k), float(env_v)
+            source = "environment"
+    if k_scale is None:
+        k_scale = v_scale = 1.0
+        logger.warning(
+            "QSA FP8 KV cache for %s uses scale=1.0 (non-quality bring-up "
+            "mode; provide QSA_FP8_SCALES_FILE for calibrated runs)",
+            layer.layer_name,
+        )
+    else:
+        logger.info(
+            "QSA FP8 KV scales for %s from %s: k=%.6g v=%.6g",
+            layer.layer_name, source, k_scale, v_scale,
+        )
+    if k_scale <= 0 or v_scale <= 0:
+        raise ValueError("QSA FP8 scales must be positive")
+    layer._k_scale.fill_(k_scale)
+    layer._v_scale.fill_(v_scale)
+    layer._k_scale_float = float(k_scale)
+    layer._v_scale_float = float(v_scale)
+
+# --- Optional calibration collection (QSA_FP8_CALIBRATE_OUT) --------------
+# Opt-in running absmax collector for K/V rows entering the cache. Active
+# only when QSA_FP8_CALIBRATE_OUT is set; intended for dedicated calibration
+# runs, never for production. GPU-resident running maxima (no per-step sync);
+# flushed to disk periodically and at exit.
+_CALIBRATE_OUT = os.environ.get("QSA_FP8_CALIBRATE_OUT")
+_CALIB_STATE: dict[str, dict[str, torch.Tensor | int]] = {}
+_CALIB_FLUSH_EVERY = 50  # forward calls
+
+
+def _calibration_update(
+    layer: nn.Module, key: torch.Tensor, value: torch.Tensor
+) -> None:
+    if _CALIBRATE_OUT is None:
+        return
+    entry = _CALIB_STATE.get(layer.layer_name)
+    if entry is None:
+        entry = _CALIB_STATE[layer.layer_name] = {
+            "k_absmax": torch.zeros((), dtype=torch.float32, device=key.device),
+            "v_absmax": torch.zeros((), dtype=torch.float32, device=key.device),
+            "calls": 0,
+        }
+    # Warmup/capture passes can carry NaN/inf dummy data; only finite
+    # magnitudes may influence a calibration maximum.
+    k_now = torch.nan_to_num(key.detach().float().abs().max(), nan=0.0,
+                             posinf=0.0)
+    v_now = torch.nan_to_num(value.detach().float().abs().max(), nan=0.0,
+                             posinf=0.0)
+    torch.maximum(entry["k_absmax"], k_now, out=entry["k_absmax"])
+    torch.maximum(entry["v_absmax"], v_now, out=entry["v_absmax"])
+    entry["calls"] += 1
+    if entry["calls"] % _CALIB_FLUSH_EVERY == 0:
+        _calibration_flush()
+
+
+def _calibration_flush() -> None:
+    if _CALIBRATE_OUT is None or not _CALIB_STATE:
+        return
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    rank = get_tensor_model_parallel_rank()
+    per_layer = {}
+    for name, entry in sorted(_CALIB_STATE.items()):
+        k_abs = float(entry["k_absmax"].item())
+        v_abs = float(entry["v_absmax"].item())
+        per_layer[name] = {
+            "k_absmax": k_abs,
+            "v_absmax": v_abs,
+            "k_scale": k_abs / 448.0,
+            "v_scale": v_abs / 448.0,
+        }
+    path = f"{_CALIBRATE_OUT}.rank{rank}.json"
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"per_layer": per_layer}, f, indent=2)
+    os.replace(tmp, path)
+
+
+if _CALIBRATE_OUT is not None:
+    import atexit
+
+    atexit.register(_calibration_flush)
+    logger.info("QSA FP8 calibration collection active -> %s", _CALIBRATE_OUT)
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -68,7 +200,50 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     """FullAttentionSpec backend used by the merged QSA owner."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
+
+    # FP8 E4M3 is supported as *storage* with a software decode in the QSA
+    # Triton kernel. The inherited FlashAttention classmethods route every
+    # quantized dtype through flash_attn_supports_kv_cache_dtype, which is
+    # sm_90/100-only; both gates are overridden here to check list membership
+    # only. Generic FlashAttention semantics are untouched.
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+        if kv_cache_dtype is None:
+            return True
+        return kv_cache_dtype in cls.supported_kv_cache_dtypes
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size,
+        dtype,
+        kv_cache_dtype,
+        block_size,
+        use_mla,
+        has_sink,
+        use_sparse,
+        use_mm_prefix,
+        device_capability,
+    ):
+        # Skip only the FP8 arch gate; all other FA combination rules apply.
+        return FlashAttentionBackend.supports_combination.__func__(
+            cls,
+            head_size,
+            dtype,
+            None if kv_cache_dtype in ("fp8", "fp8_e4m3") else kv_cache_dtype,
+            block_size,
+            use_mla,
+            has_sink,
+            use_sparse,
+            use_mm_prefix,
+            device_capability,
+        )
 
     @staticmethod
     def get_name() -> str:
@@ -103,15 +278,28 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     supports_pcp: bool = False
 
     def __init__(self, *args, **kwargs) -> None:
+        # FlashAttentionImpl.__init__ rejects FP8 KV caches unless the
+        # platform is sm_90/sm_100. QSA never runs the FA kernels — it only
+        # inherits do_kv_cache_update and metadata plumbing — so the dtype is
+        # masked during super().__init__ and restored immediately after.
+        requested_kv_dtype = args[6] if len(args) > 6 else kwargs.get(
+            "kv_cache_dtype", "auto"
+        )
+        if requested_kv_dtype in ("fp8", "fp8_e4m3"):
+            if len(args) > 6:
+                args = (*args[:6], "auto", *args[7:])
+            else:
+                kwargs["kv_cache_dtype"] = "auto"
         super().__init__(*args, **kwargs)
+        self.kv_cache_dtype = requested_kv_dtype
         if not is_flash_attn_varlen_func_available():
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
         if self.dcp_world_size != 1:
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if self.kv_cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
+        if self.kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+            raise NotImplementedError("Qwen4Exp QSA requires a BF16 or FP8 E4M3 main KV cache")
         self.supports_quant_query_input = False
 
     def forward_qsa(
@@ -148,8 +336,14 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
-        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
+        is_fp8 = self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+        expected_cache_dtype = torch.uint8 if is_fp8 else torch.bfloat16
+        if key_cache.dtype != expected_cache_dtype or query.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires BF16 Q and a "
+                f"{'uint8 FP8' if is_fp8 else 'BF16'} main KV cache, got "
+                f"cache={key_cache.dtype} query={query.dtype}"
+            )
 
         from .ops.qsa import qsa_sparse_paged_attention
 
@@ -161,6 +355,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             attn_metadata.block_table,
             token_to_req,
             output[:num_tokens],
+            k_scale=layer._k_scale if is_fp8 else None,
+            v_scale=layer._v_scale if is_fp8 else None,
         )
         return output
 
@@ -187,8 +383,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
-        if cache_config.cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
+        if cache_config.cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+            raise NotImplementedError("Qwen4Exp QSA requires a BF16 or FP8 E4M3 main KV cache")
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
@@ -282,11 +478,18 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")
+        _is_fp8_kv = self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+        expected_storage = torch.uint8 if _is_fp8_kv else torch.bfloat16
+        if self.kv_cache_torch_dtype != expected_storage:
+            raise NotImplementedError(
+                f"Qwen4Exp QSA requires {expected_storage} cache "
+                f"storage for kv_cache_dtype={self.kv_cache_dtype}"
+            )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
+        if _is_fp8_kv:
+            _apply_qsa_fp8_scales(self)
 
         self.attn_backend = Qwen4ExpQSAFlashAttentionBackend
         self.impl = Qwen4ExpQSAFlashAttentionImpl(
@@ -353,6 +556,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if not isinstance(metadata, dict):
             output.zero_()
             return
+        _calibration_update(self, key, value)
         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])
         if self.kv_cache.numel() == 0:
             raise RuntimeError("QSA main K/V cache is not bound")

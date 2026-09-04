@@ -14,6 +14,25 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
+@triton.jit
+def _e4m3_decode_f32(bytes_):
+    """Bit-exact E4M3 (float8_e4m3fn) decode of raw uint8 to fp32.
+
+    Mirrors tests/e4m3.py: 1 sign / 4 exp (bias 7) / 3 mantissa, subnormals
+    at exponent 0, NaN at S.1111.111, max finite 448. CPU-verified over all
+    256 byte patterns. exp2 of small exact integers is exact in fp32.
+    """
+    b = bytes_.to(tl.int32)
+    sign = (b >> 7) & 0x1
+    exp = (b >> 3) & 0xF
+    mant = b & 0x7
+    is_sub = exp == 0
+    mantissa = tl.where(is_sub, mant, mant + 8).to(tl.float32)
+    exponent = tl.where(is_sub, -9, exp - 10).to(tl.float32)
+    value = mantissa * tl.math.exp2(exponent)
+    value = tl.where((exp == 0xF) & (mant == 0x7), float("nan"), value)
+    return tl.where(sign == 1, -value, value)
+
 
 @triton.jit
 def _qsa_mqa_paged_kernel(
@@ -194,6 +213,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -225,6 +246,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -297,6 +319,18 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if IS_FP8:
+            # Ampere has no native FP8 load: bytes arrive as uint8 and are
+            # decoded bit-exactly (torch.float8_e4m3fn semantics, verified
+            # over all 256 patterns in tests/test_e4m3_decode.py). The writer
+            # stores x / scale (proven by tests/test_writer_fp8.py), so the
+            # reader multiplies by the static per-tensor scale.
+            k_scale = tl.load(k_scale_ptr)
+            v_scale = tl.load(v_scale_ptr)
+            keys = _e4m3_decode_f32(keys) * k_scale
+            values = _e4m3_decode_f32(values) * v_scale
+            keys = keys.to(tl.bfloat16)
+            values = values.to(tl.bfloat16)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -817,8 +851,17 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    _profile_override: tuple[int, int, int] | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 or FP8 E4M3 K/V caches.
+
+    FP8 mode: k_cache/v_cache are uint8 tensors holding E4M3 bytes written
+    as x / scale by reshape_and_cache_flash; k_scale/v_scale are scalar fp32
+    device tensors. Bytes are decoded in registers; the BF16 path is
+    unchanged.
+    """
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
@@ -836,7 +879,15 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    is_fp8 = k_cache.dtype == torch.uint8
+    if is_fp8:
+        assert q.dtype == torch.bfloat16 and v_cache.dtype == torch.uint8
+        if k_scale is None or v_scale is None:
+            raise ValueError("QSA FP8 attention requires k_scale and v_scale")
+    else:
+        assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+        k_scale = k_scale if k_scale is not None else q
+        v_scale = v_scale if v_scale is not None else q
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -871,6 +922,24 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+    if is_fp8:
+        # Register pressure from the in-register E4M3 decode makes the
+        # 64-wide BF16 profiles ~22x slower on sm_86 (spills). The 16-wide
+        # profile with 4 warps stays within 2% of BF16.
+        # Register pressure from the in-register E4M3 decode makes the
+        # 64-wide BF16 profiles ~22x slower on sm_86 (spills and smem
+        # overflow). Swept on sm_86 (tests/sweep_qsa_fp8.py): BLOCK_N=16 with
+        # 4 warps is optimal at every batch; split targets below.
+        if base_programs <= 8:
+            block_n, target_splits, partial_warps = 16, 64, 4
+        elif base_programs < 32:
+            block_n, target_splits, partial_warps = 16, 32, 4
+        elif base_programs <= 256:
+            block_n, target_splits, partial_warps = 16, 16, 4
+        else:
+            block_n, target_splits, partial_warps = 16, 8, 4
+    if _profile_override is not None:
+        block_n, target_splits, partial_warps = _profile_override
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
@@ -898,6 +967,8 @@ def qsa_sparse_paged_attention(
         q,
         k_cache,
         v_cache,
+        k_scale,
+        v_scale,
         logical_indices,
         block_table,
         token_to_req,
@@ -929,9 +1000,10 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        IS_FP8=is_fp8,
         num_warps=partial_warps,
-        num_stages=2,
-    )
+                num_stages=2,
+    )  # the FP8 profile is pinned to BLOCK_N=16, which fits smem at stages=2
     if num_splits == 1:
         return out
 
