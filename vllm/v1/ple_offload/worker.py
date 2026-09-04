@@ -62,7 +62,6 @@ from vllm.v1.ple_offload.protocol import (
     PleOffloadRegistration,
     PleOffloadRequest,
 )
-from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
@@ -614,11 +613,6 @@ class PleOffloadRunner:
 
     def _handle_requests(self, requests: list[PleOffloadRequest]) -> None:
         """Run requests layer-first so each DP rank can resume promptly."""
-        with record_function_or_nullcontext("ple_offload: handle_requests"):
-            self._handle_requests_impl(requests)
-
-    def _handle_requests_impl(self, requests: list[PleOffloadRequest]) -> None:
-        """Process one batch of PLE requests."""
         requests_by_dp: dict[int, PleOffloadRequest] = {}
         for request in requests:
             if request.dp_rank not in self._worker_targets:
