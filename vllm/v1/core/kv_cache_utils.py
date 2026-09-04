@@ -1432,6 +1432,8 @@ def get_kv_cache_config_from_groups(
 
     kv_cache_tensors = []
     for group in kv_cache_groups:
+        if not group.layer_names: # ref. https://github.com/vllm-project/vllm/issues/54711
+            continue
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
